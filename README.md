@@ -106,7 +106,10 @@ Open that serial port in Teraterm or another serial terminal with **115200 baud,
 
 ## Run the USB Camera
 
-Keep the serial console connected and connect the board's Type-C USB device port to the viewing host with a data-capable cable. The camera application starts manually. Run as root from the serial console or a network session with `vvcam.service` active and `/dev/video1` available. Stop other camera, UVC, and display applications first. USB camera mode replaces USB ADB/MTP and can disconnect a USB shell.
+Connect the board's Type-C USB device port to the viewing computer with a
+data-capable cable. Close any other camera apps on the board, then run the
+camera as root from the serial console or a network session. Starting the
+camera can disconnect a USB shell.
 
 ```bash
 k230-camera           # USB camera with LCD preview
@@ -115,7 +118,8 @@ k230-camera --no-lcd  # USB camera only
 
 On the USB host, select the camera in a UVC-compatible viewer. The default stream is MJPEG at 2592×1944 with a nominal 30 fps; the host can also select 640×360, 1280×720, or 1920×1080. Actual throughput depends on scene complexity and host behavior. The optional LCD preview uses an 800×480 output.
 
-Press Ctrl+C to stop the application and restore previously active ADB/MTP. Logs are under `/run/k230-camera/`. See the [camera guide](docs/project-guide.md#manual-imx335-usb-camera) for operation details and validation notes.
+Press Ctrl+C to stop the camera. For troubleshooting and advanced operation,
+see the [camera guide](docs/project-guide.md#manual-imx335-usb-camera).
 
 The UVC gadget uses test VID `0x1209` and PID `0x0001`; replace these IDs before production use.
 

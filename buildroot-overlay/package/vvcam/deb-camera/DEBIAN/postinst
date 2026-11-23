@@ -1,0 +1,6 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = configure ]; then
+    "${DPKG_ROOT:-}/etc/vvcam/enable-vvcam-drivers.sh" "${DPKG_ROOT:-/}"
+fi

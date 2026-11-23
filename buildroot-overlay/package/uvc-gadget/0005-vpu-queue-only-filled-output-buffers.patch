@@ -1,0 +1,1323 @@
+Subject: [PATCH] vpu: queue only completed JPEG buffers to USB
+
+Hand encoded packets to the event loop through an eventfd, retain borrowed
+sink buffers until a packet is available, and prime both output buffers with
+real JPEGs before starting USB. Bound startup with a timerfd and unwind partial
+starts on failure or shutdown. Initialize hardware in the worker, use bounded
+nonblocking capture waits, and keep packet/thread ownership across restarts.
+If the vendor encoder cannot stop, exit before releasing worker-owned memory
+so the camera supervisor can restart the process.
+
+--- a/lib/vpu-source.c
++++ b/lib/vpu-source.c
+@@ -5,6 +5,10 @@
+  * Copyright (C) 2024
+  */
+ 
++#ifndef _GNU_SOURCE
++#define _GNU_SOURCE
++#endif
++
+ #include "config.h"
+ 
+ #include <errno.h>
+@@ -16,6 +20,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <sys/mman.h>
++#include <sys/eventfd.h>
+ #include <unistd.h>
+ #include <sys/syscall.h>
+ #include <sys/time.h>
+@@ -63,23 +68,32 @@
+ 	AVPacket *pkt;
+ 
+ 	/* Stop flag */
+-	int stop_flag;
++	atomic_int stop_flag;
++	atomic_int worker_error;
+ 
+ 	/* Thread ID */
+ 	pthread_t vpu_tid;
++	int thread_started;
++	int event_fd;
++	int event_watched;
+ 
+ 	/* Encoded packet queue (circular buffer) */
+ 	AVPacket **packet_queue;
+-	atomic_int packet_queue_size;  /* Use atomic for lock-free reads */
++	int packet_queue_size;
+ 	int packet_queue_capacity;
+-	atomic_int packet_queue_head;  /* Index to dequeue from */
+-	atomic_int packet_queue_tail;  /* Index to enqueue to */
++	int packet_queue_head;
++	int packet_queue_tail;
+ 	pthread_mutex_t packet_mutex;
+ 	pthread_cond_t packet_cond;
+ 
+ 	/* Buffer pool for encoded output */
+ 	struct video_buffer_set *output_buffers;
+ 
++	/* Only the event-loop thread owns these borrowed sink buffers. */
++	struct video_buffer *pending_buffers;
++	unsigned int pending_count;
++	unsigned int pending_head;
++
+ 	/* Encoder type */
+ 
+ 	char *camera_device;
+@@ -93,8 +107,6 @@
+ 	int set_width;
+ 	int set_height;
+ 	uint32_t max_frame_size;
+-	/* Initialize flag */
+-	int initialized;
+ };
+ 
+ #define to_vpu_source(s) container_of(s, struct vpu_source, src)
+@@ -111,6 +123,13 @@
+ 	return 0;
+ }
+ 
++static int vpu_source_interrupt(void *opaque)
++{
++	struct vpu_source *src = opaque;
++
++	return atomic_load(&src->stop_flag);
++}
++
+ static int init_camera(struct vpu_source *src, const char *camera_device, int width, int height)
+ {
+ 	/* Register all device formats (needed for v4l2 input) */
+@@ -139,9 +158,18 @@
+ 	av_dict_set_int(&options, "buffer_size", 4096, 0);
+ 	av_dict_set_int(&options, "input_queue_size", 1, 0);
+ 	av_dict_set(&options, "analyzeduration", "0", 0);
+-	av_dict_set(&options, "fflags", "nobuffer+igndts", 0);
+ 	av_dict_set(&options, "flags", "low_delay", 0);
+ 
++	src->fmt_ctx = avformat_alloc_context();
++	if (!src->fmt_ctx) {
++		av_dict_free(&options);
++		return -ENOMEM;
++	}
++	/* FFmpeg v4l2 does not consult AVIOInterruptCB in VIDIOC_DQBUF.
++	 * Nonblocking capture plus the stop condition below bounds that wait. */
++	src->fmt_ctx->flags |= AVFMT_FLAG_NONBLOCK | AVFMT_FLAG_NOBUFFER | AVFMT_FLAG_IGNDTS;
++	src->fmt_ctx->interrupt_callback.callback = vpu_source_interrupt;
++	src->fmt_ctx->interrupt_callback.opaque = src;
+ 	if (avformat_open_input(&src->fmt_ctx, camera_device, src->input_fmt, &options) != 0) {
+ 		fprintf(stderr, "Cannot open camera device: %s\n", camera_device);
+ 		av_dict_free(&options);
+@@ -159,11 +187,8 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	if (avformat_find_stream_info(src->fmt_ctx, NULL) < 0) {
+-		fprintf(stderr, "Cannot find stream info\n");
+-		avformat_close_input(&src->fmt_ctx);
+-		return -1;
+-	}
++	/* v4l2 read_header already supplied the raw-video stream parameters.
++	 * Probing would dequeue frames and delay the startup timeout. */
+ 
+ 	/* Log camera stream parameters for debugging */
+ 	AVCodecParameters *cp = src->fmt_ctx->streams[0]->codecpar;
+@@ -175,68 +200,125 @@
+ 	return 0;
+ }
+ 
+-/* Queue encoded packet */
+-static void queue_encoded_packet(struct vpu_source *src, AVPacket *pkt, int pkt_count)
++/* The worker never touches sink buffers, handlers, or the events list. */
++static void vpu_source_notify(struct vpu_source *src)
+ {
+-	AVPacket *encoded_pkt = NULL;
++	uint64_t value = 1;
++	ssize_t ret;
+ 
+-	if (src->stop_flag)
+-		return;
++	do {
++		ret = write(src->event_fd, &value, sizeof(value));
++	} while (ret < 0 && errno == EINTR);
++	/* EAGAIN means a notification is already pending. */
++	if (ret < 0 && errno != EAGAIN)
++		fprintf(stderr, "vpu-source: notification failed: %s\n", strerror(errno));
++}
+ 
+-	encoded_pkt = av_packet_alloc();
+-	if (!encoded_pkt) {
+-		fprintf(stderr, "Failed to allocate encoded packet\n");
+-		return;
+-	}
++static void vpu_source_fail(struct vpu_source *src, int error)
++{
++	atomic_store(&src->worker_error, error < 0 ? error : -EIO);
++	vpu_source_notify(src);
++}
+ 
++/* Returns only after publishing the packet, a failure, or a stop request. */
++static int queue_encoded_packet(struct vpu_source *src, AVPacket *pkt)
++{
++	AVPacket *encoded_pkt = av_packet_alloc();
++
++	if (!encoded_pkt)
++		return -ENOMEM;
+ 	av_packet_move_ref(encoded_pkt, pkt);
+ 
+-	// fprintf(stderr, "[vpu-thread] about to lock mutex, queue_size=%d, capacity=%d\n",
+-	// 	src->packet_queue_size, src->packet_queue_capacity);
+ 	pthread_mutex_lock(&src->packet_mutex);
+-	//fprintf(stderr, "[vpu-thread] got mutex, queue_size=%d\n", src->packet_queue_size);
+-
+-	/* Wait until space is available in the queue */
+-	while (src->packet_queue_size >= src->packet_queue_capacity && !src->stop_flag) {
+-		fprintf(stderr, "[vpu-thread] queue full, waiting on cond (size=%d >= cap=%d)...\n",
+-		 	src->packet_queue_size, src->packet_queue_capacity);
++	while (src->packet_queue_size == src->packet_queue_capacity &&
++	       !atomic_load(&src->stop_flag))
+ 		pthread_cond_wait(&src->packet_cond, &src->packet_mutex);
+-		//fprintf(stderr, "[vpu-thread] cond wait done\n");
++
++	/* Stop may have woken a producer waiting on a full queue. */
++	if (atomic_load(&src->stop_flag)) {
++		pthread_mutex_unlock(&src->packet_mutex);
++		av_packet_free(&encoded_pkt);
++		return -ECANCELED;
+ 	}
+ 
+ 	src->packet_queue[src->packet_queue_tail] = encoded_pkt;
+ 	src->packet_queue_tail = (src->packet_queue_tail + 1) % src->packet_queue_capacity;
+ 	src->packet_queue_size++;
++	pthread_mutex_unlock(&src->packet_mutex);
++	vpu_source_notify(src);
++	return 0;
++}
+ 
+-	/* Notify waiting queue_buffer threads */
+-	//fprintf(stderr, "[vpu-thread] about to signal cond, queue_size=%d\n", src->packet_queue_size);
+-	pthread_cond_signal(&src->packet_cond);
++/* Consume packets and fill borrowed buffers exclusively on the event loop. */
++static int vpu_source_fill_pending(struct vpu_source *src)
++{
++	while (src->pending_count) {
++		struct video_buffer buf;
++		AVPacket *pkt;
++		int error = atomic_load(&src->worker_error);
+ 
+-	pthread_mutex_unlock(&src->packet_mutex);
++		if (error)
++			return error;
++		pthread_mutex_lock(&src->packet_mutex);
++		if (!src->packet_queue_size) {
++			pthread_mutex_unlock(&src->packet_mutex);
++			break;
++		}
++		pkt = src->packet_queue[src->packet_queue_head];
++		src->packet_queue[src->packet_queue_head] = NULL;
++		src->packet_queue_head = (src->packet_queue_head + 1) % src->packet_queue_capacity;
++		src->packet_queue_size--;
++		pthread_cond_signal(&src->packet_cond);
++		pthread_mutex_unlock(&src->packet_mutex);
+ 
++		buf = src->pending_buffers[src->pending_head];
++		if (!pkt->data || pkt->size <= 0 || (size_t)pkt->size > buf.size) {
++			fprintf(stderr, "vpu-source: invalid packet size %d (buffer %u)\n",
++				pkt->size, buf.size);
++			av_packet_free(&pkt);
++			return -EMSGSIZE;
++		}
+ 
+-	if (pkt_count <= 5 || pkt_count % 90000 == 0) {
+-		printf("vpu_thread: pkt %d queued, size=%d, queue_size=%d max=%d \n",
+-			pkt_count, encoded_pkt->size, src->packet_queue_size, src->packet_queue_capacity);
++		memcpy(buf.mem, pkt->data, pkt->size);
++		buf.bytesused = pkt->size;
++		buf.timestamp.tv_sec = pkt->pts / 1000000;
++		buf.timestamp.tv_usec = pkt->pts % 1000000;
++		av_packet_free(&pkt);
++		src->pending_head = (src->pending_head + 1) % src->output_buffers->nbufs;
++		src->pending_count--;
++		if (src->src.handler)
++			src->src.handler(src->src.handler_data, &src->src, &buf);
++		/* A sink callback may have stopped the loop after a USB failure. */
++		if (src->src.events->done)
++			break;
+ 	}
+-
++	return atomic_load(&src->worker_error);
+ }
+ 
++static void vpu_source_drain_notifications(struct vpu_source *src)
++{
++	uint64_t value;
++	ssize_t ret;
++
++	do {
++		ret = read(src->event_fd, &value, sizeof(value));
++	} while (ret == sizeof(value) || (ret < 0 && errno == EINTR));
++}
+ 
+-// /* Frame rate control - sleep if needed */
+-// static void frame_rate_control(uint64_t *last_frame_time, uint64_t frame_interval_us, int frame_count)
+-// {
+-// 	struct timespec now;
+-// 	clock_gettime(CLOCK_MONOTONIC, &now);
+-// 	uint64_t current_time = now.tv_sec * 1000000ULL + now.tv_nsec / 1000;
+-// 	uint64_t elapsed = current_time - *last_frame_time;
++static void vpu_source_dispatch(void *d)
++{
++	struct vpu_source *src = d;
++	int ret;
+ 
+-// 	if (frame_count > 1 && elapsed < frame_interval_us) {
+-// 		uint64_t sleep_us = frame_interval_us - elapsed;
+-// 		usleep(sleep_us);
+-// 	}
+-// 	*last_frame_time = current_time;
+-// }
++	vpu_source_drain_notifications(src);
++	if (!src->thread_started)
++		return;
++	ret = vpu_source_fill_pending(src);
++	if (ret < 0) {
++		fprintf(stderr, "vpu-source: encoding failed: %s (%d)\n", strerror(-ret), -ret);
++		events_stop(src->src.events);
++	}
++}
+ 
+ static int init_encoder(struct vpu_source *src, int width, int height)
+ {
+@@ -301,6 +383,10 @@
+ 	av_dict_free(&codec_options);
+ 
+ 	src->frame = av_frame_alloc();
++	if (!src->frame) {
++		avcodec_free_context(&src->codec_ctx);
++		return -ENOMEM;
++	}
+ 	src->frame->format = src->codec_ctx->pix_fmt;
+ 	src->frame->width = src->codec_ctx->width;
+ 	src->frame->height = src->codec_ctx->height;
+@@ -325,185 +411,115 @@
+ 	return 0;
+ }
+ 
+-static void *vpu_thread(void *arg)
++/* FFmpeg does not expose its v4l2 fd for poll(). Wait briefly on the
++ * stop condition after nonblocking EAGAIN, rather than spinning or blocking
++ * inside DQBUF. STREAMOFF broadcasts this condition to wake us immediately. */
++static int vpu_source_wait_for_frame(struct vpu_source *src)
+ {
+-	struct vpu_source *src = (struct vpu_source *)arg;
+-	int ret;
+-
+-	int pkt_count = 0;
+-	//uint64_t last_frame_time = 0;
+-
+-	/* Set thread name for debugging */
+-	prctl(PR_SET_NAME, "vpu-encode", 0, 0, 0);
+-
+-	printf("vpu_thread start, TID: %d\n", (int)syscall(SYS_gettid));
++	struct timespec deadline;
++	int ret = 0;
+ 
+-	/* Frame interval in microseconds (30fps = ~33333us) */
+-	//uint64_t frame_interval_us = (src->frame_rate > 0) ? (1000000 / src->frame_rate) : 33333;
++	if (clock_gettime(CLOCK_REALTIME, &deadline) < 0)
++		return -errno;
++	deadline.tv_nsec += 5000000;
++	if (deadline.tv_nsec >= 1000000000) {
++		deadline.tv_sec++;
++		deadline.tv_nsec -= 1000000000;
++	}
++	pthread_mutex_lock(&src->packet_mutex);
++	if (!atomic_load(&src->stop_flag))
++		ret = pthread_cond_timedwait(&src->packet_cond, &src->packet_mutex, &deadline);
++	if (atomic_load(&src->stop_flag))
++		ret = ECANCELED;
++	pthread_mutex_unlock(&src->packet_mutex);
++	return ret && ret != ETIMEDOUT ? -ret : 0;
++}
+ 
++static void *vpu_thread(void *arg)
++{
++	struct vpu_source *src = arg;
+ 	AVPacket *raw_pkt = av_packet_alloc();
+-	if (!raw_pkt) {
+-		fprintf(stderr, "Failed to allocate raw packet\n");
+-		return NULL;
+-	}
++	int ret = -ENOMEM;
++
++	prctl(PR_SET_NAME, "vpu-encode", 0, 0, 0);
++	if (!raw_pkt)
++		goto done;
++	/* All hardware initialization runs off the event loop, covered by the
++	 * startup timer, including STREAMON without a new format negotiation. */
++	if (atomic_load(&src->stop_flag))
++		goto done;
++	ret = init_camera(src, src->camera_device, src->set_width, src->set_height);
++	if (ret < 0)
++		goto done;
++	ret = init_encoder(src, src->set_width, src->set_height);
++	if (ret < 0)
++		goto done;
+ 
+-	while (!src->stop_flag) {
+-		// if( (frame_count %100 == 0)|| frame_count <5 )
+-		// 	printf("[DEBUG] %s: %d - Frame %d start processing at %lu ms\n", __func__, __LINE__, frame_count,get_time_ms());
++	while (!atomic_load(&src->stop_flag)) {
++		int cam_width = src->fmt_ctx->streams[0]->codecpar->width;
++		int cam_height = src->fmt_ctx->streams[0]->codecpar->height;
+ 
+-		/* Read raw frame from camera */
+ 		ret = av_read_frame(src->fmt_ctx, raw_pkt);
+-		if (ret < 0) {
+-			fprintf(stderr, "Error reading frame: %d\n", ret);
+-			break;
++		if (ret == AVERROR(EAGAIN)) {
++			ret = vpu_source_wait_for_frame(src);
++			if (ret < 0)
++				break;
++			continue;
+ 		}
+-
++		if (ret < 0)
++			break;
+ 		if (raw_pkt->stream_index != 0) {
+-			av_packet_free(&raw_pkt);
+-			raw_pkt = av_packet_alloc();
+-			if (!raw_pkt) {
+-				break;
+-			}
++			av_packet_unref(raw_pkt);
+ 			continue;
+ 		}
+ 
+ 		frame_count++;
+-		// if(frame_count%3==0){
+-		// 	av_packet_free(&raw_pkt);
+-		// 	raw_pkt = av_packet_alloc();
+-		// 	if (!raw_pkt) {
+-		// 		break;
+-		// 	}
+-		// 	continue;
+-		// }
+-
+-
+-		//printf("capture fram=%d\n", frame_count);
+-
+-		/* Reference camera RTSP demo - directly point frame to raw_pkt data (zero-copy) */
+-		int cam_width = src->fmt_ctx->streams[0]->codecpar->width;
+-		int cam_height = src->fmt_ctx->streams[0]->codecpar->height;
+-
+-		/* Direct pointer assignment - no memcpy */
+ 		src->frame->data[0] = raw_pkt->data;
+ 		src->frame->linesize[0] = cam_width;
+ 		src->frame->data[1] = raw_pkt->data + cam_width * cam_height;
+ 		src->frame->linesize[1] = cam_width;
+-		src->frame->pts = frame_count*(1000000ULL/src->frame_rate);//raw_pkt->pts;
++		src->frame->pts = frame_count * (1000000ULL / src->frame_rate);
+ 
+-		// if( (frame_count %101 == 0)|| frame_count <5 )
+-		// 	printf("[DEBUG] %s: %d - Frame %d start processing at %lu ms\n", __func__, __LINE__, frame_count,get_time_ms());
+-
+-
+-		/* Send frame to encoder */
+ 		ret = avcodec_send_frame(src->codec_ctx, src->frame);
+-		if (ret < 0) {
+-			fprintf(stderr, "Error sending frame to encoder: %d\n", ret);
+-			av_packet_free(&raw_pkt);
++		if (ret < 0)
+ 			break;
+-		}
+-		// if( (frame_count %101 == 0)|| frame_count <5 )
+-		// 	printf("[DEBUG] %s: %d - Frame %d start processing at %lu ms\n", __func__, __LINE__, frame_count,get_time_ms());
+-		/* Receive encoded packets - loop until EAGAIN */
+ 		for (;;) {
+ 			ret = avcodec_receive_packet(src->codec_ctx, src->pkt);
+-			if (ret == AVERROR(EAGAIN)) { //EAGAIN = "Try again" - 编码器暂时没有可用的输出包,表示编码器内部缓冲区为空，需要先送入新的帧才能生成输出包
+-				//usleep(1000); //1ms;
++			if (ret == AVERROR(EAGAIN))
+ 				break;
+-			} else if (ret == AVERROR_EOF) {
+-				break;
+-			} else if (ret < 0) {
+-				fprintf(stderr, "Error receiving packet: %d\n", ret);
+-				break;
+-			}
+-			pkt_count++;
+-
+-
+-			// if( (frame_count %101 == 0)|| frame_count <5 )
+-			// 	printf("[DEBUG] %s: %d - Frame %d start processing at %lu ms\n", __func__, __LINE__, frame_count,get_time_ms());
+-			/* Queue encoded packet */
+-			queue_encoded_packet(src, src->pkt, pkt_count);
+-			// if( (frame_count %101 == 0)|| frame_count <5 )
+-			// 	printf("[DEBUG] %s: %d - Frame %d start processing at %lu ms\n", __func__, __LINE__, frame_count,get_time_ms());
++			if (ret < 0)
++				goto done;
++			ret = queue_encoded_packet(src, src->pkt);
++			if (ret < 0)
++				goto done;
+ 		}
+-
+-		av_packet_free(&raw_pkt);
+-		raw_pkt = av_packet_alloc();
+-		if (!raw_pkt) {
+-			break;
+-		}
+-		//usleep(1000);
++		av_packet_unref(raw_pkt);
+ 	}
+ 
+-	printf("vpu_thread exit, frames: %d, pkts: %d\n", frame_count, pkt_count);
+-
++done:
+ 	av_packet_free(&raw_pkt);
+-
++	if (!atomic_load(&src->stop_flag))
++		vpu_source_fail(src, ret);
+ 	return NULL;
+ }
+ 
++static int vpu_source_stream_off(struct video_source *s);
++static int vpu_source_free_buffers(struct video_source *s);
++
+ static void vpu_source_destroy(struct video_source *s)
+ {
+ 	struct vpu_source *src = to_vpu_source(s);
+ 
+-	src->stop_flag = 1;
+-
+-	/* Wake up any waiting threads before joining */
+-	pthread_mutex_lock(&src->packet_mutex);
+-	pthread_cond_broadcast(&src->packet_cond);
+-	pthread_mutex_unlock(&src->packet_mutex);
+-
+-	if (src->vpu_tid) {
+-		pthread_join(src->vpu_tid, NULL);
+-	}
+-
+-	/* Cleanup packets in queue */
+-	pthread_mutex_lock(&src->packet_mutex);
+-	/* Free all packets in the queue (circular buffer) */
+-	if (src->packet_queue_head <= src->packet_queue_tail) {
+-		/* No wrap - contiguous data */
+-		for (int i = src->packet_queue_head; i < src->packet_queue_tail; i++) {
+-			if (src->packet_queue[i]) {
+-				av_packet_free(&src->packet_queue[i]);
+-			}
+-		}
+-	} else {
+-		/* Wrapped - data in two segments */
+-		for (int i = src->packet_queue_head; i < src->packet_queue_capacity; i++) {
+-			if (src->packet_queue[i]) {
+-				av_packet_free(&src->packet_queue[i]);
+-			}
+-		}
+-		for (int i = 0; i < src->packet_queue_tail; i++) {
+-			if (src->packet_queue[i]) {
+-				av_packet_free(&src->packet_queue[i]);
+-			}
+-		}
+-	}
+-	/* Wake up any waiting queue_buffer threads */
+-	pthread_cond_broadcast(&src->packet_cond);
+-	pthread_mutex_unlock(&src->packet_mutex);
+-
+-	/* Cleanup FFmpeg resources */
++	vpu_source_free_buffers(s);
++	if (src->event_watched)
++		events_unwatch_fd(s->events, src->event_fd, EVENT_READ);
++	close(src->event_fd);
+ 	av_packet_free(&src->pkt);
+ 	av_frame_free(&src->frame);
+ 	avcodec_free_context(&src->codec_ctx);
+ 	avformat_close_input(&src->fmt_ctx);
+-
+-	/* Cleanup video buffers */
+-	if (src->output_buffers) {
+-		for (unsigned int i = 0; i < src->output_buffers->nbufs; i++) {
+-			if (src->output_buffers->buffers[i].mem) {
+-				free(src->output_buffers->buffers[i].mem);
+-				src->output_buffers->buffers[i].mem = NULL;
+-			}
+-		}
+-		video_buffer_set_delete(src->output_buffers);
+-	}
+-
+ 	pthread_mutex_destroy(&src->packet_mutex);
+ 	pthread_cond_destroy(&src->packet_cond);
+-
+ 	free(src->camera_device);
+ 	free(src);
+ }
+@@ -513,6 +529,9 @@
+ 	struct vpu_source *src = to_vpu_source(s);
+ 	int ret;
+ 
++	if (src->thread_started)
++		return -EBUSY;
++	atomic_store(&src->stop_flag, 0);
+ 	ret = mjpeg_frame_capacity(fmt->width, fmt->height, &src->max_frame_size);
+ 	if (ret < 0) {
+ 		fprintf(stderr, "Invalid MJPEG dimensions %ux%u\n", fmt->width, fmt->height);
+@@ -525,31 +544,6 @@
+ 	fmt->pixelformat = V4L2_PIX_FMT_MJPEG;
+ 	fmt->field = V4L2_FIELD_ANY;
+ 
+-	/* Reinitialize if width or height changed */
+-	if (!src->initialized ||
+-	    src->set_width != src->codec_ctx->width ||
+-	    src->set_height != src->codec_ctx->height) {
+-		/* Cleanup existing resources if already initialized */
+-		if (src->initialized) {
+-			src->initialized = 0;
+-			avcodec_free_context(&src->codec_ctx);
+-			av_frame_free(&src->frame);
+-			av_packet_free(&src->pkt);
+-			avformat_close_input(&src->fmt_ctx);
+-		}
+-		/* Initialize camera with new format (uses current frame_rate) */
+-		ret = init_camera(src, src->camera_device, src->set_width, src->set_height);
+-		if (ret < 0) {
+-			return -1;
+-		}
+-		/* Initialize encoder with new format */
+-		ret = init_encoder(src, src->set_width, src->set_height);
+-		if (ret < 0) {
+-			avformat_close_input(&src->fmt_ctx);
+-			return -1;
+-		}
+-		src->initialized = 1;
+-	}
+ 	fmt->sizeimage = src->max_frame_size;
+ 
+ 	return 0;
+@@ -558,57 +552,38 @@
+ static int vpu_source_set_frame_rate(struct video_source *s, unsigned int fps)
+ {
+ 	struct vpu_source *src = to_vpu_source(s);
+-	int ret;
++
++	if (src->thread_started)
++		return -EBUSY;
++	if (!fps || fps > INT_MAX)
++		return -EINVAL;
+ 	src->frame_rate = fps;
+-	/* Reinitialize camera with new frame rate immediately */
+-	if (src->initialized && src->fmt_ctx) {
+-		avformat_close_input(&src->fmt_ctx);
+-		ret = init_camera(src, src->camera_device, src->set_width, src->set_height);
+-		if (ret < 0) {
+-			return -1;
+-		}
+-	}
+ 	return 0;
+ }
+ 
+ static int vpu_source_alloc_buffers(struct video_source *s, unsigned int nbufs)
+ {
+ 	struct vpu_source *src = to_vpu_source(s);
+-	if(nbufs < 2 )
+-		nbufs = 2;
+-
+-	unsigned int queue_size = nbufs;
+ 
+-	/* Allocate output buffer set */
++	if (src->output_buffers || src->thread_started)
++		return -EBUSY;
++	if (nbufs < 2)
++		nbufs = 2;
+ 	src->output_buffers = video_buffer_set_new(nbufs);
+-	if (!src->output_buffers) {
++	if (!src->output_buffers)
+ 		return -ENOMEM;
+-	}
+-
+-
+-	src->packet_queue_capacity = queue_size;
+-	//printf("f=%s l=%d xxxcap=%d\n", __func__, __LINE__, src->packet_queue_capacity);
+-	src->packet_queue = (AVPacket **)calloc(queue_size, sizeof(AVPacket *));
+-	if (!src->packet_queue) {
+-		video_buffer_set_delete(src->output_buffers);
++	src->packet_queue = calloc(nbufs, sizeof(*src->packet_queue));
++	src->pending_buffers = calloc(nbufs, sizeof(*src->pending_buffers));
++	if (!src->packet_queue || !src->pending_buffers) {
++		vpu_source_free_buffers(s);
+ 		return -ENOMEM;
+ 	}
+-	src->packet_queue_size = 0;
+-	src->packet_queue_head = 0;
+-	src->packet_queue_tail = 0;
+-
+-	/* Buffer memory will be provided by sink via import_buffers */
+-	for (unsigned int i = 0; i < nbufs; i++) {
+-		src->output_buffers->buffers[i].size = src->max_frame_size;
+-		src->output_buffers->buffers[i].mem = NULL;
+-		src->output_buffers->buffers[i].dmabuf = -1;
+-	}
+-
++	src->packet_queue_capacity = nbufs;
+ 	return 0;
+ }
+ 
+ static int vpu_source_export_buffers(struct video_source *s,
+-					      struct video_buffer_set **bufs)
++				     struct video_buffer_set **bufs)
+ {
+ 	struct vpu_source *src = to_vpu_source(s);
+ 
+@@ -617,56 +592,46 @@
+ }
+ 
+ static int vpu_source_import_buffers(struct video_source *s,
+-					      struct video_buffer_set *buffers)
++				     struct video_buffer_set *buffers)
+ {
+ 	struct vpu_source *src = to_vpu_source(s);
+ 
+-	/* Use sink's buffer memory for encoded output */
+-	for (unsigned int i = 0; i < buffers->nbufs; i++) {
+-		src->output_buffers->buffers[i].mem = buffers->buffers[i].mem;
+-		src->output_buffers->buffers[i].size = buffers->buffers[i].size;
+-		src->output_buffers->buffers[i].dmabuf = buffers->buffers[i].dmabuf;
+-	}
+-
++	if (!src->output_buffers || buffers->nbufs != src->output_buffers->nbufs)
++		return -EINVAL;
++	for (unsigned int i = 0; i < buffers->nbufs; i++)
++		src->output_buffers->buffers[i] = buffers->buffers[i];
+ 	return 0;
+ }
+ 
++static void vpu_source_clear_packets(struct vpu_source *src)
++{
++	/* The worker has been joined before the queue storage can be cleared. */
++	for (int i = 0; i < src->packet_queue_capacity; i++)
++		av_packet_free(&src->packet_queue[i]);
++	src->packet_queue_size = 0;
++	src->packet_queue_head = 0;
++	src->packet_queue_tail = 0;
++	src->pending_count = 0;
++	src->pending_head = 0;
++	atomic_store(&src->worker_error, 0);
++	vpu_source_drain_notifications(src);
++}
++
+ static int vpu_source_free_buffers(struct video_source *s)
+ {
+ 	struct vpu_source *src = to_vpu_source(s);
+ 
+-	/* Buffer memory is owned by sink, don't free it */
++	vpu_source_stream_off(s);
++	/* Imported memory belongs to the sink; only delete the descriptors. */
+ 	if (src->output_buffers) {
+ 		video_buffer_set_delete(src->output_buffers);
+ 		src->output_buffers = NULL;
+ 	}
+-
+-	if (src->packet_queue) {
+-		/* Free all packets in the queue (circular buffer) */
+-		if (src->packet_queue_head <= src->packet_queue_tail) {
+-			/* No wrap - contiguous data */
+-			for (int i = src->packet_queue_head; i < src->packet_queue_tail; i++) {
+-				if (src->packet_queue[i]) {
+-					av_packet_free(&src->packet_queue[i]);
+-				}
+-			}
+-		} else {
+-			/* Wrapped - data in two segments */
+-			for (int i = src->packet_queue_head; i < src->packet_queue_capacity; i++) {
+-				if (src->packet_queue[i]) {
+-					av_packet_free(&src->packet_queue[i]);
+-				}
+-			}
+-			for (int i = 0; i < src->packet_queue_tail; i++) {
+-				if (src->packet_queue[i]) {
+-					av_packet_free(&src->packet_queue[i]);
+-				}
+-			}
+-		}
+-		free(src->packet_queue);
+-		src->packet_queue = NULL;
+-	}
+-
++	free(src->packet_queue);
++	src->packet_queue = NULL;
++	src->packet_queue_capacity = 0;
++	free(src->pending_buffers);
++	src->pending_buffers = NULL;
+ 	return 0;
+ }
+ 
+@@ -675,17 +640,16 @@
+ 	struct vpu_source *src = to_vpu_source(s);
+ 	int ret;
+ 
+-	src->stop_flag = 0;
+-
++	if (src->thread_started || !src->set_width || !src->set_height ||
++	    !src->output_buffers || !src->event_watched)
++		return -EINVAL;
++	atomic_store(&src->stop_flag, 0);
++	atomic_store(&src->worker_error, 0);
++	vpu_source_drain_notifications(src);
+ 	ret = pthread_create(&src->vpu_tid, NULL, vpu_thread, src);
+-	if (ret) {
+-		fprintf(stderr, "Failed to create vpu thread\n");
+-		return -1;
+-	}
+-
+-	/* Start encoding immediately without waiting for first packet */
+-	/* queue_buffer will handle empty queue by checking vpu_source_if_have_data */
+-
++	if (ret)
++		return -ret;
++	src->thread_started = 1;
+ 	return 0;
+ }
+ 
+@@ -693,74 +657,74 @@
+ {
+ 	struct vpu_source *src = to_vpu_source(s);
+ 
+-	src->stop_flag = 1;
+-
+-	/* Wake up any waiting queue_buffer threads */
+ 	pthread_mutex_lock(&src->packet_mutex);
++	atomic_store(&src->stop_flag, 1);
+ 	pthread_cond_broadcast(&src->packet_cond);
+ 	pthread_mutex_unlock(&src->packet_mutex);
+-
+-	pthread_join(src->vpu_tid, NULL);
+-
++	if (src->thread_started) {
++		struct timespec deadline;
++		int ret;
++
++		/* The vendor encoder can block forever inside poll(-1), ignoring
++		 * AVIOInterruptCB. Never release memory still owned by that worker.
++		 * A failed join ends the process so the camera supervisor recovers. */
++		if (clock_gettime(CLOCK_REALTIME, &deadline) < 0) {
++			fprintf(stderr, "vpu-source: cannot bound worker shutdown: %s\n",
++				strerror(errno));
++			_exit(EXIT_FAILURE);
++		}
++		deadline.tv_sec += 2;
++		ret = pthread_timedjoin_np(src->vpu_tid, NULL, &deadline);
++		if (ret) {
++			fprintf(stderr, "vpu-source: worker shutdown failed after stop request: %s (%d); exiting for recovery\n",
++				strerror(ret), ret);
++			_exit(EXIT_FAILURE);
++		}
++		src->thread_started = 0;
++		/* The next worker reopens capture and encoder at the stored format. */
++		av_packet_free(&src->pkt);
++		av_frame_free(&src->frame);
++		avcodec_free_context(&src->codec_ctx);
++		avformat_close_input(&src->fmt_ctx);
++	}
++	vpu_source_clear_packets(src);
+ 	return 0;
+ }
++
++/* Retained for callers of the vendor symbol; streaming no longer polls it. */
+ int vpu_source_if_have_data(struct video_source *s)
+ {
+-	int ret = 0;
+ 	struct vpu_source *src = to_vpu_source(s);
++	int count;
+ 
+ 	pthread_mutex_lock(&src->packet_mutex);
+-	ret = src->packet_queue_size;
++	count = src->packet_queue_size;
+ 	pthread_mutex_unlock(&src->packet_mutex);
+-	return ret;
++	return count;
+ }
+ 
+ static int vpu_source_queue_buffer(struct video_source *s, struct video_buffer *buf)
+ {
+ 	struct vpu_source *src = to_vpu_source(s);
+-	int ret = 0;
+-	AVPacket *pkt = NULL;
+-
+-	//fprintf(stderr, "[main-thread] about to lock mutex, queue_size=%d\n", src->packet_queue_size);
+-	pthread_mutex_lock(&src->packet_mutex);
+-	if(src->packet_queue_size > 0){
+-		pkt = src->packet_queue[src->packet_queue_head];
+-		src->packet_queue_head = (src->packet_queue_head + 1) % src->packet_queue_capacity;
+-		src->packet_queue_size--;
+-		pthread_cond_signal(&src->packet_cond);
+-	}
+-	pthread_mutex_unlock(&src->packet_mutex);
+-
+-
+-	if (pkt && pkt->data) {
+-		if ((size_t)pkt->size <= buf->size) {
+-			memcpy(buf->mem, pkt->data, pkt->size);
+-			buf->bytesused = pkt->size;
+-			buf->timestamp.tv_sec = pkt->pts / 1000000;
+-			buf->timestamp.tv_usec = pkt->pts % 1000000;
++	unsigned int tail;
+ 
+-
+-			// printf("[vpu-source] queue_buffer: size=%d, bytesused=%u, queue_left=%d\n",
+-		} else {
+-			fprintf(stderr, "vpu-source: buffer too small (pkt=%d, buf=%u)\n",
+-				pkt->size, (unsigned int)buf->size);
+-			buf->bytesused = 0;
+-			ret = -ENOMEM;
+-		}
+-		av_packet_free(&pkt);
+-	} else {
+-		buf->bytesused = 0;
+-	}
+-
+-	/* Always call handler to requeue buffer */
+-	if (src->src.handler) {
+-		//printf("[vpu-source] calling handler...\n");
+-		src->src.handler(src->src.handler_data, s, buf);
+-	}
+-	// if( (frame_count %101 == 0)|| frame_count <5 )
+-	// 		printf("[DEBUG] %s: %d - Frame %d start processing at %lu ms\n", __func__, __LINE__, frame_count,get_time_ms());
+-
+-	return ret;
++	if (s->events && s->events->done)
++		return -ECANCELED;
++	if (!src->output_buffers || !buf->mem || !buf->size ||
++	    buf->index >= src->output_buffers->nbufs)
++		return -EINVAL;
++	if (src->pending_count == src->output_buffers->nbufs)
++		return -ENOSPC;
++	/* A borrowed buffer must never be submitted twice. */
++	for (unsigned int i = 0; i < src->pending_count; i++) {
++		unsigned int index = (src->pending_head + i) % src->output_buffers->nbufs;
++		if (src->pending_buffers[index].index == buf->index)
++			return -EINVAL;
++	}
++	tail = (src->pending_head + src->pending_count) % src->output_buffers->nbufs;
++	src->pending_buffers[tail] = *buf;
++	src->pending_count++;
++	return vpu_source_fill_pending(src);
+ }
+ 
+ static const struct video_source_ops vpu_source_ops = {
+@@ -786,12 +750,22 @@
+ 		return NULL;
+ 	}
+ 
++	src->event_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
++	if (src->event_fd < 0 || src->event_fd >= FD_SETSIZE) {
++		if (src->event_fd >= 0)
++			close(src->event_fd);
++		free(src);
++		return NULL;
++	}
++	atomic_init(&src->stop_flag, 0);
++	atomic_init(&src->worker_error, 0);
+ 	src->src.ops = &vpu_source_ops;
+ 	src->src.type = VIDEO_SOURCE_VPU_ENCODED;
+ 
+-	/* Save configuration for later initialization in set_format */
++	/* Save configuration for hardware initialization in the worker. */
+ 	src->camera_device = strdup(camera_device);
+ 	if (!src->camera_device) {
++		close(src->event_fd);
+ 		free(src);
+ 		return NULL;
+ 	}
+@@ -809,5 +783,11 @@
+ {
+ 	struct vpu_source *src = to_vpu_source(s);
+ 
++	if (src->event_watched)
++		events_unwatch_fd(src->src.events, src->event_fd, EVENT_READ);
+ 	src->src.events = events;
++	events_watch_fd(events, src->event_fd, EVENT_READ, vpu_source_dispatch, src);
++	src->event_watched = FD_ISSET(src->event_fd, &events->rfds);
++	if (!src->event_watched)
++		fprintf(stderr, "vpu-source: failed to watch encoder notifications\n");
+ }
+--- a/lib/stream.c
++++ b/lib/stream.c
+@@ -12,6 +12,8 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <unistd.h>
++#include <stdint.h>
++#include <sys/timerfd.h>
+ 
+ #include "events.h"
+ #include "stream.h"
+@@ -32,12 +34,104 @@
+ 	struct uvc_device *uvc;
+ 
+ 	struct events *events;
++
++	/* VPU startup and partial-start ownership, event-loop thread only. */
++	int startup_fd;
++	int startup_watched;
++	int vpu_active;
++	int vpu_failed;
++	int source_allocated;
++	int sink_allocated;
++	int source_started;
++	int sink_started;
++	int sink_watched;
++	unsigned int primed_count;
++	unsigned int expected_buffers;
+ };
+ 
+ /* ---------------------------------------------------------------------------
+  * Video streaming
+  */
+ 
++void uvc_stream_uvc_process_vpu(void *d);
++static int uvc_stream_stop_vpu(struct uvc_stream *stream);
++
++static void uvc_stream_vpu_fail(struct uvc_stream *stream, const char *operation, int error)
++{
++	if (stream->vpu_failed)
++		return;
++	stream->vpu_failed = 1;
++	fprintf(stderr, "VPU stream: %s failed: %s (%d)\n",
++		operation, strerror(-error), -error);
++	events_stop(stream->events);
++}
++
++static void uvc_stream_vpu_disarm_timer(struct uvc_stream *stream)
++{
++	struct itimerspec timeout = { 0 };
++	uint64_t expirations;
++	ssize_t ret;
++
++	if (stream->startup_fd < 0)
++		return;
++	timerfd_settime(stream->startup_fd, 0, &timeout, NULL);
++	do {
++		ret = read(stream->startup_fd, &expirations, sizeof(expirations));
++	} while (ret == sizeof(expirations) || (ret < 0 && errno == EINTR));
++}
++
++static void uvc_stream_vpu_timeout(void *d)
++{
++	struct uvc_stream *stream = d;
++	uint64_t expirations;
++	ssize_t ret;
++
++	do {
++		ret = read(stream->startup_fd, &expirations, sizeof(expirations));
++	} while (ret < 0 && errno == EINTR);
++	if (ret == sizeof(expirations) && stream->vpu_active && !stream->sink_started)
++		uvc_stream_vpu_fail(stream, "startup timeout (10 seconds)", -ETIMEDOUT);
++}
++
++static void uvc_stream_vpu_source_process(struct uvc_stream *stream,
++					struct video_buffer *buffer)
++{
++	struct v4l2_device *sink = uvc_v4l2_device(stream->uvc);
++	int ret;
++
++	if (!stream->vpu_active || stream->vpu_failed || stream->events->done)
++		return;
++	if (!buffer->bytesused || buffer->bytesused > buffer->size) {
++		uvc_stream_vpu_fail(stream, "invalid output size", -EMSGSIZE);
++		return;
++	}
++	ret = v4l2_queue_buffer(sink, buffer);
++	if (ret < 0) {
++		uvc_stream_vpu_fail(stream, "USB queue", ret);
++		return;
++	}
++	if (stream->sink_started)
++		return;
++
++	/* Both buffers must contain a JPEG before USB can start consuming them. */
++	if (++stream->primed_count < stream->expected_buffers)
++		return;
++	ret = v4l2_stream_on(sink);
++	if (ret < 0) {
++		uvc_stream_vpu_fail(stream, "USB stream-on", ret);
++		return;
++	}
++	stream->sink_started = 1;
++	events_watch_fd(stream->events, sink->fd, EVENT_WRITE,
++			uvc_stream_uvc_process_vpu, stream);
++	if (!FD_ISSET(sink->fd, &stream->events->wfds)) {
++		uvc_stream_vpu_fail(stream, "USB event watch", -ENOMEM);
++		return;
++	}
++	stream->sink_watched = 1;
++	uvc_stream_vpu_disarm_timer(stream);
++}
++
+ static void uvc_stream_source_process(void *d,
+ 				      struct video_source *src __attribute__((unused)),
+ 				      struct video_buffer *buffer)
+@@ -45,6 +139,10 @@
+ 	struct uvc_stream *stream = d;
+ 	struct v4l2_device *sink = uvc_v4l2_device(stream->uvc);
+ 
++	if (stream->src->type == VIDEO_SOURCE_VPU_ENCODED) {
++		uvc_stream_vpu_source_process(stream, buffer);
++		return;
++	}
+ 	v4l2_queue_buffer(sink, buffer);
+ }
+ // static uint64_t get_time_ms(void)
+@@ -249,7 +347,6 @@
+ 
+ 	return ret;
+ }
+-extern  int vpu_source_if_have_data(struct video_source *s);
+ void uvc_stream_uvc_process_vpu(void *d)
+ {
+ 	struct uvc_stream *stream = d;
+@@ -257,99 +354,141 @@
+ 	struct video_buffer buf;
+ 	int ret;
+ 
+-	//printf("[DEBUG] %s: %d - Frame %d start processing at %lu ms\n", __func__, __LINE__, frame_count,get_time_ms());
+-	if(vpu_source_if_have_data(stream->src) <=0 ) { //no data
+-		/* Sleep 1ms to avoid busy loop */
+-		usleep(10000);
++	if (!stream->vpu_active || stream->vpu_failed || stream->events->done)
+ 		return;
+-	}
+-
+ 	ret = v4l2_dequeue_buffer(sink, &buf);
+-	if (ret < 0)
++	if (ret == -EAGAIN || ret == -EINTR)
+ 		return;
++	if (ret < 0 || buf.error) {
++		uvc_stream_vpu_fail(stream, "USB dequeue", ret < 0 ? ret : -EIO);
++		return;
++	}
++	ret = video_source_queue_buffer(stream->src, &buf);
++	if (ret < 0)
++		uvc_stream_vpu_fail(stream, "source queue", ret);
++}
+ 
+-	//printf("[uvc_stream] dequeue buffer %u, bytesused=%u\n", buf.index, buf.bytesused);
+-	//printf("[uvc_stream] calling queue_buffer...\n");
+-	video_source_queue_buffer(stream->src, &buf);
+-	//printf("[uvc_stream] queue_buffer done\n");
+-	//printf("[DEBUG] %s: %d - Frame %d start processing at %lu ms\n", __func__, __LINE__, frame_count,get_time_ms());
+-
++/* Timer stays registered until stream deletion: callbacks never remove their
++ * own event-list entry, including STREAMOFF received during startup. */
++static int uvc_stream_vpu_prepare_timer(struct uvc_stream *stream)
++{
++	struct itimerspec timeout = { .it_value = { .tv_sec = 10 } };
++
++	if (!stream->startup_watched) {
++		stream->startup_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
++		if (stream->startup_fd < 0)
++			return -errno;
++		if (stream->startup_fd >= FD_SETSIZE) {
++			close(stream->startup_fd);
++			stream->startup_fd = -1;
++			return -EMFILE;
++		}
++		events_watch_fd(stream->events, stream->startup_fd, EVENT_READ,
++				uvc_stream_vpu_timeout, stream);
++		if (!FD_ISSET(stream->startup_fd, &stream->events->rfds)) {
++			close(stream->startup_fd);
++			stream->startup_fd = -1;
++			return -ENOMEM;
++		}
++		stream->startup_watched = 1;
++	}
++	uvc_stream_vpu_disarm_timer(stream);
++	if (timerfd_settime(stream->startup_fd, 0, &timeout, NULL) < 0)
++		return -errno;
++	return 0;
+ }
+-/* For VIDEO_SOURCE_VPU_ENCODED (vpu-source)
+- * Initial queue buffers then wait for first packet before dequeuing */
++
+ static int uvc_stream_start_vpu_encoded(struct uvc_stream *stream)
+ {
+ 	struct v4l2_device *sink = uvc_v4l2_device(stream->uvc);
+ 	int ret;
+-	unsigned int i;
+ 
+-	/* Allocate the buffers on the source. */
+-	ret = video_source_alloc_buffers(stream->src, 2);
+-	if (ret < 0) {
+-		printf("Failed to allocate source buffers: %s (%d)\n",
+-		       strerror(-ret), -ret);
+-		return ret;
++	if (stream->vpu_active)
++		return 0;
++	stream->vpu_active = 1;
++	stream->vpu_failed = 0;
++	stream->primed_count = 0;
++	if (sink->fd < 0 || sink->fd >= FD_SETSIZE) {
++		ret = -EMFILE;
++		goto error;
+ 	}
++	ret = uvc_stream_vpu_prepare_timer(stream);
++	if (ret < 0)
++		goto error;
+ 
+-	/* Allocate buffers on the sink. */
++	ret = video_source_alloc_buffers(stream->src, 2);
++	if (ret < 0)
++		goto error;
++	stream->source_allocated = 1;
+ 	ret = v4l2_alloc_buffers(sink, V4L2_MEMORY_MMAP, 2);
+-	if (ret < 0) {
+-		printf("Failed to allocate sink buffers: %s (%d)\n",
+-		       strerror(-ret), -ret);
+-		goto error_free_source;
++	if (ret < 0)
++		goto error;
++	stream->sink_allocated = 1;
++	/* Exactly two buffers bound startup latency and source ownership. */
++	if (sink->buffers.nbufs != 2) {
++		ret = -EINVAL;
++		goto error;
+ 	}
+-
+-	/* mmap buffers. */
++	stream->expected_buffers = sink->buffers.nbufs;
+ 	ret = v4l2_mmap_buffers(sink);
+-	if (ret < 0) {
+-		printf("Failed to query sink buffers: %s (%d)\n",
+-				strerror(-ret), -ret);
+-		goto error_free_sink;
+-	}
+-
+-	/* Import the sink's buffers to the source */
++	if (ret < 0)
++		goto error;
+ 	ret = video_source_import_buffers(stream->src, &sink->buffers);
+-	if (ret) {
+-		printf("Failed to import sink buffers: %s (%d)\n",
+-		       strerror(ret), ret);
+-		goto error_free_sink;
+-	}
+-
+-	/* Queue all sink buffers to the source.
+-	 * vpu-source will fill them with encoded data when available. */
+-	for (i = 0; i < sink->buffers.nbufs; ++i) {
+-		struct video_buffer buf = {
+-			.index = i,
+-			.size = sink->buffers.buffers[i].size,
+-			.mem = sink->buffers.buffers[i].mem,
+-			.bytesused = 0,
+-			.timestamp = {0, 0},
+-		};
++	if (ret < 0)
++		goto error;
+ 
+-		ret = v4l2_queue_buffer(sink, &buf);
+-		if (ret < 0) {
+-			printf("Failed to queue buffer %u to sink: %s (%d)\n",
+-				i, strerror(-ret), -ret);
+-			goto error_free_sink;
+-		}
+-		//printf("Queued buffer %u to sink, bytesused=%u\n", i, buf.bytesused);
++	/* The source borrows empty buffers; USB sees only completed JPEGs. */
++	for (unsigned int i = 0; i < sink->buffers.nbufs; ++i) {
++		struct video_buffer buf = sink->buffers.buffers[i];
++
++		buf.index = i;
++		buf.bytesused = 0;
++		ret = video_source_queue_buffer(stream->src, &buf);
++		if (ret < 0)
++			goto error;
+ 	}
++	ret = video_source_stream_on(stream->src);
++	if (ret < 0)
++		goto error;
++	stream->source_started = 1;
++	return 0;
+ 
+-	/* Start the source and sink. */
+-	video_source_stream_on(stream->src);
+-	v4l2_stream_on(sink);
++error:
++	uvc_stream_vpu_fail(stream, "startup", ret);
++	uvc_stream_stop_vpu(stream);
++	return ret;
++}
+ 
+-	events_watch_fd(stream->events, sink->fd, EVENT_WRITE,
+-			uvc_stream_uvc_process_vpu, stream);
++static int uvc_stream_stop_vpu(struct uvc_stream *stream)
++{
++	struct v4l2_device *sink = uvc_v4l2_device(stream->uvc);
+ 
++	uvc_stream_vpu_disarm_timer(stream);
++	if (stream->sink_watched) {
++		events_unwatch_fd(stream->events, sink->fd, EVENT_WRITE);
++		stream->sink_watched = 0;
++	}
++	if (stream->sink_started) {
++		v4l2_stream_off(sink);
++		stream->sink_started = 0;
++	}
++	if (stream->source_started) {
++		video_source_stream_off(stream->src);
++		stream->source_started = 0;
++	}
++	/* Source releases borrowed descriptors before the sink unmaps memory. */
++	if (stream->source_allocated) {
++		video_source_free_buffers(stream->src);
++		stream->source_allocated = 0;
++	}
++	if (stream->sink_allocated) {
++		v4l2_free_buffers(sink);
++		stream->sink_allocated = 0;
++	}
++	stream->vpu_active = 0;
++	stream->primed_count = 0;
++	stream->expected_buffers = 0;
+ 	return 0;
+-
+-error_free_sink:
+-	v4l2_free_buffers(sink);
+-error_free_source:
+-	video_source_free_buffers(stream->src);
+-
+-	return ret;
+ }
+ 
+ static int uvc_stream_start(struct uvc_stream *stream)
+@@ -385,6 +524,8 @@
+ 
+ 	printf("Stopping video stream.\n");
+ 
++	if (stream->src->type == VIDEO_SOURCE_VPU_ENCODED)
++		return uvc_stream_stop_vpu(stream);
+ 	events_unwatch_fd(stream->events, sink->fd, EVENT_WRITE);
+ 
+ 	v4l2_stream_off(sink);
+@@ -439,6 +580,7 @@
+ 		return NULL;
+ 
+ 	memset(stream, 0, sizeof(*stream));
++	stream->startup_fd = -1;
+ 
+ 	stream->uvc = uvc_open(uvc_device, stream);
+ 	if (stream->uvc == NULL)
+@@ -456,6 +598,12 @@
+ 	if (stream == NULL)
+ 		return;
+ 
++	if (stream->src && stream->src->type == VIDEO_SOURCE_VPU_ENCODED)
++		uvc_stream_stop_vpu(stream);
++	if (stream->startup_watched)
++		events_unwatch_fd(stream->events, stream->startup_fd, EVENT_READ);
++	if (stream->startup_fd >= 0)
++		close(stream->startup_fd);
+ 	uvc_close(stream->uvc);
+ 
+ 	free(stream);

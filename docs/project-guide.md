@@ -26,6 +26,7 @@ Commands below run from the repository root unless stated otherwise.
   - [Flash the eMMC Board](#flash-the-emmc-board)
   - [On-Device Notes](#on-device-notes)
   - [Manual IMX335 USB Camera](#manual-imx335-usb-camera)
+  - [Recover the CSI2 sensor by rebinding the MIPI driver](#recover-the-csi2-sensor-by-rebinding-the-mipi-driver)
   - [Reference Links](#reference-links)
 
 ## Project Scope
@@ -420,11 +421,16 @@ ifup wlan0
 
 ## Manual IMX335 USB Camera
 
-The IMX335 configuration installs `k230-camera` for manual use; it has no boot
-service. Stop manually launched camera, UVC, and display applications first.
-Run as root with `vvcam.service` active and `/dev/video1` available.
-Run from UART or a network session: USB camera mode replaces USB ADB/MTP and
-can disconnect a USB shell.
+On the camera distribution image, `vvcam-drivers.service` loads the VVCAM
+modules at boot, including the MIPI driver that resets the sensor during probe.
+The ISP and ADB/MTP start on demand. Run `k230-camera` as root from UART or a
+network session after stopping other camera, UVC, and display applications.
+The launcher waits for `vvcam-isp.service` to open `/dev/video1` before
+switching the USB gadget. ISP startup fails if the server exits during startup
+or does not open the device within 10 seconds. Inspect its journal with
+`journalctl -u vvcam-isp.service -b`. USB camera mode suspends active ADB/MTP
+and can disconnect a USB shell. If ADB/MTP is still binding the USB controller,
+the launcher waits for it to finish before switching modes.
 
 ```bash
 k230-camera            # USB camera plus best-effort LCD preview
@@ -445,41 +451,147 @@ its precise driver or host-side cause. JPEG quality remains 50 (1-100) and is
 not automatically reduced to maintain frame rate. Delivered throughput still
 depends on scene complexity and host behavior.
 
-Encoded frames are no longer periodically discarded. Recheck cold-start
-behavior and simultaneous LCD/UVC operation on the rebuilt image.
+At UVC startup, the two USB output buffers are retained until they contain
+encoded packets. Encoder notifications wake the event loop to fill and queue
+available buffers. Startup must fill both initial buffers and start USB within
+10 seconds; otherwise it fails and records an error in
+`/run/k230-camera/uvc.log`. Encoded frames are not periodically discarded.
+JPEG quality, UVC descriptors, and endpoint settings are unchanged.
+
+Capture uses nonblocking reads so a missing sensor frame does not hold up
+shutdown. If the vendor encoder remains blocked after a stop request, the
+gadget allows two seconds for the worker to exit, then logs the failure and
+terminates the process without freeing memory still in use by that worker.
+The camera supervisor retries the gadget after its normal three-second delay.
 
 The optional LCD preview uses `/dev/video2`, an
 800x480 output, and rotation 1. LCD setup is best effort and does not detect
 whether a physical panel is connected. UVC retries every three seconds after
-failure. Press Ctrl+C to clean up and restore previously active ADB/MTP.
+failure. Press Ctrl+C to stop capture, release the UVC gadget, stop the ISP
+instance started by the launcher if it is still running, and restore previously
+active ADB/MTP.
 Logs are `/run/k230-camera/uvc.log`, `/run/k230-camera/lcd.log`, and
 `/run/k230-camera/gadget.log`.
 
-To enable the package in an existing IMX335 build and rebuild changed packages:
+Start or stop the ISP independently with `systemctl start vvcam-isp.service`
+or `systemctl stop vvcam-isp.service`. To manage ADB/MTP, use
+`/etc/vvcam/S41adb_mtp start` and `/etc/vvcam/S41adb_mtp stop`.
+To upgrade an existing Debian camera image, copy the packages from
+`images/deb/` to the board and run the following as root. The launcher package
+depends on `psmisc` for its `fuser` capture check. Fresh camera images supply
+`fuser` when the base filesystem lacks it. Installing the UVC package also
+registers it on images that shipped its files without a package entry.
+
+```sh
+apt install ./k230-vvcam.deb ./k230-camera.deb ./k230-uvc-gadget.deb
+```
+
+The VVCAM package updates the boot links without restarting the running ISP
+or USB gadget. Reboot before using the updated camera launcher.
+
+To enable the package in an existing IMX335 build or rebuild all changed
+components, compile as your normal user and package the Debian image as root.
+When reusing a diagnostic build tree, first remove these exact obsolete
+generated patches if present; overlay synchronization does not delete removed
+files:
 
 ```bash
-make CONF=k230_canmv_EC2K230K1AI_MCM5M30M12F3_uvc_defconfig
-# Remove obsolete generated patches when reusing a diagnostic build tree.
-# SDK overlay synchronization copies files without deleting removed files.
 rm -f output/buildroot-2025.02.1/package/uvc-gadget/0004-vpu-warm-up-capture-before-encoding.patch
 rm -f output/buildroot-2025.02.1/package/uvc-gadget/0005-vpu-add-opt-in-uvc-buffer-diagnostic-dump.patch
+make CONF=k230_canmv_EC2K230K1AI_MCM5M30M12F3_uvc_defconfig
 make vvcam-dirclean
 make vvcam
 make ffmpeg-dirclean
 make ffmpeg
 make uvc-gadget-dirclean
 make uvc-gadget
-make k230_camera-rebuild
+make k230_camera-dirclean
+make k230_camera
 make buildroot
 sudo make debian
 ```
 
+For a focused UVC patch refresh when its dependencies are already built, run:
+
+```bash
+make CONF=k230_canmv_EC2K230K1AI_MCM5M30M12F3_uvc_defconfig uvc-gadget-dirclean
+make CONF=k230_canmv_EC2K230K1AI_MCM5M30M12F3_uvc_defconfig uvc-gadget
+make CONF=k230_canmv_EC2K230K1AI_MCM5M30M12F3_uvc_defconfig buildroot
+sudo make debian
+```
+
 The Debian package is generated as `images/deb/k230-camera.deb` in that
-configuration's output directory. Validate full-resolution image geometry,
-sustained encoder and receiver frame rates, smaller UVC resolutions, repeated
-launches, and operation with and without LCD preview. Measure frame counts
-against elapsed wall-clock time; the VVCAM timestamp/sequence metadata is not
-reliable for FPS measurement.
+configuration's output directory. `sudo make debian` uses `.last_conf` set by
+the normal-user build command; do not pass `CONF` to `sudo make`, because that
+would make `.last_conf` root-owned.
+
+Hardware acceptance is still required. Confirm the first received frame is a
+valid JPEG, then test 640x360, 1280x720, 1920x1080, and 2592x1944 for 600
+seconds each, with at least 29 decoded FPS, no corrupt frames, and no gaps of
+1 second or longer. Also repeat start/stop, USB disconnect/reconnect, UVC mode
+changes, and runs with LCD preview both enabled and disabled. Measure frame
+counts against elapsed wall-clock time; VVCAM timestamp/sequence metadata is
+not reliable for FPS measurement. Host tests do not qualify these hardware
+behaviors.
+
+## Recover the CSI2 sensor by rebinding the MIPI driver
+
+On this camera profile, probing `vvcam-mipi` pulses the CSI2 sensor reset pin
+on GPIO62. This happens at boot when the MIPI module loads and again when the
+platform device is rebound. The sensor power rail stays on.
+
+For manual recovery, use a root shell over UART or the network. Exit
+`k230-camera`, stop the ISP service, and close all other clients of
+`/dev/video*` and `/dev/vvcam-mipi.0` before unbinding.
+
+```sh
+systemctl stop vvcam-isp.service
+driver=/sys/bus/platform/drivers/vvcam-mipi
+ls -l "$driver"
+```
+
+Set `device` to the bound platform device shown by `ls`:
+
+```sh
+device=mipi.0
+[ -L "$driver/$device" ] &&
+    printf '%s' "$device" > "$driver/unbind" &&
+    printf '%s' "$device" > "$driver/bind" &&
+    ls -l /dev/vvcam-mipi.0
+```
+
+After the control node returns, relaunch `k230-camera` and verify that the
+USB host receives fresh frames. If the device fails to bind, check the kernel
+log and reboot before using the camera again. Use rebind for occasional
+recovery because the current driver allocates another video-input register
+mapping each time it probes.
+
+### Validate boot, capture, and reset on the board
+
+1. Cold boot the camera image and observe the CSI2 reset pulse. Check that
+   `systemctl is-enabled
+   vvcam-drivers.service` reports `enabled`, the driver unit is active, and
+   `lsmod` lists `vvcam_isp`, `vvcam_mipi`, `vvcam_vb`,
+   `vvcam_isp_subdev`, and `vvcam_video`. Confirm `/dev/vvcam-mipi.0`
+   exists, `vvcam-isp.service` is inactive, the host sees no ADB/MTP gadget,
+   and there are no `vvcam.service` links in the systemd target wants
+   directories. Repeat the boot checks after upgrading an existing image.
+2. Run `k230-camera --no-lcd` from UART or network SSH and verify fresh frames
+   in a UVC viewer.
+3. Press Ctrl+C in the launcher and confirm the ISP it started becomes
+   inactive. With all video clients stopped, rebind the MIPI driver and
+   observe the CSI2 reset pulse and the return of `/dev/vvcam-mipi.0`.
+   Relaunch capture and confirm the host receives fresh frames. Exit and
+   confirm ADB/MTP is still off.
+4. Start `vvcam-isp.service` and `/etc/vvcam/S41adb_mtp start` manually.
+   From UART or network SSH, launch the camera as soon as the ADB/MTP
+   helper returns. Verify frames, then exit and confirm the ISP remains
+   active and the host can use ADB/MTP. Stop both manually.
+5. Start the camera with the ISP inactive. Restart the ISP from a second
+   shell, then exit the launcher and verify the replacement ISP stays active.
+   Stop it manually.
+6. If the reported IMX335 I²C error 121, mode-setting failure, or STREAMON
+   failure recurs, repeat the rebind and check whether fresh frames return.
 
 ## Reference Links
 

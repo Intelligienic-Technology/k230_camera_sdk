@@ -4,10 +4,10 @@
 #
 ################################################################################
 
-K230_CAMERA_VERSION = 1.0
+K230_CAMERA_VERSION = 1.1
 K230_CAMERA_SITE = $(K230_CAMERA_PKGDIR)/files
 K230_CAMERA_SITE_METHOD = local
-K230_CAMERA_DEPENDENCIES = vvcam uvc-gadget bash coreutils util-linux ffmpeg
+K230_CAMERA_DEPENDENCIES = vvcam uvc-gadget bash coreutils psmisc util-linux ffmpeg
 
 define K230_CAMERA_INSTALL_TARGET_CMDS
 	$(INSTALL) -D -m 0755 $(@D)/k230-camera $(TARGET_DIR)/usr/bin/k230-camera
@@ -23,7 +23,7 @@ define K230_CAMERA_BUILD_DEB
 		'Section: utils' \
 		'Priority: optional' \
 		'Architecture: all' \
-		'Depends: bash, coreutils, util-linux, k230-vvcam, k230-uvc-gadtet' \
+		'Depends: bash, coreutils, psmisc, util-linux, k230-vvcam (>= 1.1), k230-uvc-gadtet' \
 		'Maintainer: K230 Dev <dev@example.com>' \
 		'Description: Manual IMX335 USB camera and optional LCD preview' \
 		> $(@D)/deb/DEBIAN/control

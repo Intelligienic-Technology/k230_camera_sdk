@@ -1,0 +1,11 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    remove|purge)
+        unit_dir="${DPKG_ROOT:-}/etc/systemd/system"
+        if [ -d "$unit_dir" ]; then
+            find "$unit_dir" -type l \( -path '*.wants/vvcam-drivers.service' -o -path '*.requires/vvcam-drivers.service' \) -delete
+        fi
+        ;;
+esac

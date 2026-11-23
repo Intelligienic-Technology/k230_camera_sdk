@@ -1,0 +1,13 @@
+[Unit]
+Description=VVCAM ISP media server
+Requires=vvcam-drivers.service
+After=vvcam-drivers.service
+
+[Service]
+Type=exec
+Environment=ISP_MEDIA_SENSOR_DRIVER=/lib/riscv64-linux-gnu/libvvcam.so
+ExecStart=/usr/bin/isp_media_server_debian
+ExecStartPost=/etc/vvcam/wait-for-isp.sh ${MAINPID}
+TimeoutStartSec=10s
+StandardOutput=journal
+StandardError=journal

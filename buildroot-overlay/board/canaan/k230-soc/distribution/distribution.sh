@@ -109,6 +109,57 @@ get_image_last_name() {
     echo "${canaan_site_name}_${distname}_${sdk_ver}_nncase_${nncase_ver}.img.gz"
 }
 
+extract_distribution_debs() {
+    local distname="$1"
+    local rootfs="$2"
+    local deb_dir="${BINARIES_DIR}/deb"
+    local deb_file package
+    local -a archives=("${deb_dir}"/*.deb)
+    local -a camera_archives=()
+
+    print_blue "Installing DEB packages..."
+    if [ "$distname" = debian ]; then
+        mkdir -p "${deb_dir}/remote_deb"
+        wget -c --progress=bar:force -r -np -nc -k -nd -A "*.deb" -P "${deb_dir}/remote_deb" "${DISTR_DOWN_URI}/deb/"
+        archives+=("${deb_dir}"/remote_deb/*.deb)
+    fi
+
+    if camera_is_profile "$BRW_BUILD_DIR"; then
+        camera_archives=("${deb_dir}/k230-vvcam.deb" "${deb_dir}/k230-camera.deb")
+    fi
+
+    for deb_file in "${archives[@]}"; do
+        [ -f "$deb_file" ] || continue
+        # Debian uses the remote OpenCV package to avoid local dependency issues.
+        if [ "$distname" = debian ] && [ "$deb_file" = "${deb_dir}/k230-opencv4.deb" ]; then
+            continue
+        fi
+        if (( ${#camera_archives[@]} )); then
+            package=$(dpkg-deb -f "$deb_file" Package)
+            case "$package" in
+                k230-vvcam|k230-camera) continue ;;
+            esac
+        fi
+        dpkg -x "$deb_file" "${rootfs}/"
+    done
+
+    # Extract the built camera archives once. Discard older copies by package
+    # name above, independent of their archive filenames.
+    for deb_file in "${camera_archives[@]}"; do
+        dpkg -x "$deb_file" "${rootfs}/"
+    done
+}
+
+configure_vvcam_boot() {
+    local rootfs="$1"
+    if camera_is_profile "$BRW_BUILD_DIR"; then
+        "${rootfs}/etc/vvcam/enable-vvcam-drivers.sh" "${rootfs}"
+    else
+        mkdir -p "${rootfs}/etc/systemd/system/basic.target.wants/"
+        ln -sf /etc/systemd/system/vvcam.service "${rootfs}/etc/systemd/system/basic.target.wants/vvcam.service"
+    fi
+}
+
 
 
 # Generate distribution rootfs and finalize image
@@ -173,38 +224,15 @@ distribution_rootfs_replace() {
         cp "${target_dir}/etc/version/release_version" "${distr_rootfs}/etc/version/"
     fi
 
-    # Install DEB packages for both debian and ubuntu
-    # For debian: download packages from server first
-    if [ "${distname}" = "debian" ]; then
-        print_blue "Installing DEB packages..."
-        local deb_dir="${BINARIES_DIR}/deb"
-        local opencv_backup="${BINARIES_DIR}/k230-opencv4.deb.bak"
+    extract_distribution_debs "${distname}" "${distr_rootfs}"
 
-        # Download DEB packages from server
-        mkdir -p "${deb_dir}/remote_deb"
-        wget -c --progress=bar:force -r -np -nc -k -nd -A "*.deb" -P "${deb_dir}/remote_deb" "${DISTR_DOWN_URI}/deb/"
+    configure_vvcam_boot "${distr_rootfs}"
 
-        # Temporarily move opencv package (may have dependency issues)
-        [ -f "${deb_dir}/k230-opencv4.deb" ] && mv "${deb_dir}/k230-opencv4.deb" "${opencv_backup}"
-
-        # Install all DEB packages to rootfs
-        for deb_file in "${deb_dir}"/*.deb   "${deb_dir}"/remote_deb/*.deb; do
-            [ -f "${deb_file}" ] && dpkg -x "${deb_file}" "${distr_rootfs}/"
-        done
-
-        # Restore opencv package
-        [ -f "${opencv_backup}" ] && mv "${opencv_backup}" "${deb_dir}/k230-opencv4.deb"
-    else
-        # For ubuntu: install existing deb packages (if any) from BINARIES_DIR/deb
-        print_blue "Installing DEB packages..."
-        for deb_file in "${BINARIES_DIR}/deb/"*.deb; do
-            [ -f "${deb_file}" ] && dpkg -x "${deb_file}" "${distr_rootfs}/"
-        done
+    # dpkg -x does not install dependencies. Keep the distro's fuser if present.
+    if camera_is_profile "$BRW_BUILD_DIR" &&
+       [ ! -x "${distr_rootfs}/usr/bin/fuser" ]; then
+        install -D -m 0755 "${target_dir}/usr/bin/fuser" "${distr_rootfs}/usr/bin/fuser"
     fi
-
-    # Enable vvcam service for both debian and ubuntu
-    mkdir -p "${distr_rootfs}/etc/systemd/system/basic.target.wants/"
-    ln -sf /etc/systemd/system/vvcam.service "${distr_rootfs}/etc/systemd/system/basic.target.wants/vvcam.service"
 
     # Download nncase runtime
     unzip -o  ${K230_SDK_ROOT}/dl/libnncase/nncaseruntime_k230-2.11.0-py3-none-linux_riscv64.whl -d  ${distr_rootfs}/usr/local/lib/python3.1*/dist-packages

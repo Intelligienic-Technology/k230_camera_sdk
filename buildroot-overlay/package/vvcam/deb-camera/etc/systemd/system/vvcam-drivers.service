@@ -1,0 +1,14 @@
+[Unit]
+Description=Load VVCAM camera drivers
+
+[Service]
+Type=oneshot
+ExecStart=/sbin/modprobe vvcam_isp
+ExecStart=/sbin/modprobe vvcam_mipi
+ExecStart=/sbin/modprobe vvcam_vb
+ExecStart=/sbin/modprobe vvcam_isp_subdev
+ExecStart=/sbin/modprobe vvcam_video
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -7,9 +7,10 @@ GADGET_ROOT=/sys/kernel/config/usb_gadget
 VIDEO_UVC=/dev/video1
 VIDEO_LCD=/dev/video2
 HELPER=/root/app/uvc-gadget/uvc-gadget.sh
+ISP_SERVICE=vvcam-isp.service
 ADB_SCRIPT=/etc/vvcam/S41adb_mtp
 [ -x "$ADB_SCRIPT" ] || ADB_SCRIPT=/etc/init.d/S41adb_mtp
-uvc_pid= lcd_pid= setup_attempted=0 restore_adb=0 cleaning=0
+uvc_pid= lcd_pid= setup_attempted=0 adb_active=0 restore_adb=0 isp_invocation= cleaning=0
 
 fail() { echo "k230-camera: $*" >&2; return 1; }
 
@@ -19,23 +20,72 @@ prerequisites() {
     for cmd in flock setsid timeout systemctl uvc-gadget; do
         command -v "$cmd" >/dev/null 2>&1 || { fail "missing $cmd"; return 1; }
     done
-    systemctl is-active --quiet vvcam.service || { fail 'vvcam.service is not active'; return 1; }
-    [ -c "$VIDEO_UVC" ] || { fail "$VIDEO_UVC is unavailable"; return 1; }
     [ -x "$HELPER" ] || { fail "missing gadget helper $HELPER"; return 1; }
     help=$(uvc-gadget -h 2>&1 || :)
     [[ "$help" =~ (^|[[:space:],])\-v([[:space:],=]|$) ]] || { fail 'uvc-gadget lacks -v support'; return 1; }
 }
 
+start_isp() {
+    local state startup_signal=0 start_status=0
+    state=$(systemctl show --property=ActiveState --value "$ISP_SERVICE" 9>&-) ||
+        { fail "cannot query $ISP_SERVICE"; return 1; }
+    case "$state" in
+        active|reloading) return 0 ;;
+        activating|inactive|failed) ;;
+        *) fail "$ISP_SERVICE is $state"; return 1 ;;
+    esac
+
+    # Keep the readiness job and invocation lookup together if interrupted.
+    trap 'startup_signal=130' INT
+    trap 'startup_signal=143' TERM
+    (
+        trap '' INT TERM
+        exec systemctl --job-mode=fail start "$ISP_SERVICE" 9>&-
+    ) || start_status=$?
+    if [ "$start_status" = 0 ] && [ "$state" != activating ]; then
+        isp_invocation=$(
+            trap '' INT TERM
+            exec systemctl show --property=InvocationID --value "$ISP_SERVICE" 9>&-
+        ) || isp_invocation=
+    fi
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    [ "$startup_signal" = 0 ] || exit "$startup_signal"
+    [ "$start_status" = 0 ] || { fail "could not start $ISP_SERVICE"; return 1; }
+    if [ "$state" != activating ] && [ -z "$isp_invocation" ]; then
+        fail "cannot identify the active invocation of $ISP_SERVICE"
+        return 1
+    fi
+}
+
+adb_configured() {
+    [ -L "$GADGET_ROOT/g1/configs/c.1/ffs.adb" ] &&
+        [ -L "$GADGET_ROOT/g1/configs/c.1/ffs.mtp" ]
+}
+
 check_usb() {
-    local gadget bound
+    local gadget bound holders pid i
+    local -a video_pids
     [ ! -e "$GADGET_ROOT/uvc_g1" ] || { fail 'UVC gadget already exists'; return 1; }
     for gadget in "$GADGET_ROOT"/*; do
         [ -d "$gadget" ] || continue
         bound=$(cat "$gadget/UDC" 9>&- 2>/dev/null || :)
+        if [ "$gadget" = "$GADGET_ROOT/g1" ] && [ -z "$bound" ] && adb_configured; then
+            # The manual helper binds the controller asynchronously.
+            for ((i=0; i<50; i++)); do
+                sleep 0.1 9>&-
+                bound=$(cat "$gadget/UDC" 9>&- 2>/dev/null || :)
+                [ -z "$bound" ] && adb_configured || break
+            done
+            if [ -z "$bound" ] && adb_configured; then
+                fail 'ADB/MTP gadget is configured but did not bind the controller'
+                return 1
+            fi
+        fi
         [ -n "$bound" ] || continue
         if [ "$gadget" = "$GADGET_ROOT/g1" ] && [ "$bound" = 91500000.usb ]; then
             [ -x "$ADB_SCRIPT" ] || { fail 'ADB/MTP stop helper is missing'; return 1; }
-            restore_adb=1
+            adb_active=1
         else
             fail "USB gadget $gadget is already bound to $bound"; return 1
         fi
@@ -43,9 +93,20 @@ check_usb() {
     if command -v pgrep >/dev/null 2>&1 && pgrep -x uvc-gadget 9>&- >/dev/null 2>&1; then
         fail 'uvc-gadget is already running'; return 1
     fi
-    if command -v fuser >/dev/null 2>&1 && fuser "$VIDEO_UVC" 9>&- >/dev/null 2>&1; then
-        fail "$VIDEO_UVC is already in use"; return 1
+    if command -v fuser >/dev/null 2>&1 && holders=$(fuser "$VIDEO_UVC" 9>&- 2>/dev/null); then
+        read -r -a video_pids <<< "$holders"
+        if [ "${#video_pids[@]}" = 0 ]; then
+            fail "cannot identify processes using $VIDEO_UVC"; return 1
+        fi
+        # The ISP server keeps the VVCAM nodes open while serving capture clients.
+        for pid in "${video_pids[@]}"; do
+            if [[ ! "$pid" =~ ^[0-9]+$ ]] ||
+               [ "$(readlink "/proc/$pid/exe" 9>&- 2>/dev/null)" != /usr/bin/isp_media_server_debian ]; then
+                fail "$VIDEO_UVC is already in use (PID $pid)"; return 1
+            fi
+        done
     fi
+    return 0
 }
 
 stop_group() {
@@ -61,6 +122,7 @@ stop_group() {
 }
 
 cleanup() {
+    local current_invocation
     [ "$cleaning" = 0 ] || return
     cleaning=1
     trap '' INT TERM
@@ -68,6 +130,13 @@ cleanup() {
     stop_group "$lcd_pid"
     if [ "$setup_attempted" = 1 ]; then
         timeout -k 2 15 "$HELPER" cleanup 9>&- >>"$RUN_DIR/gadget.log" 2>&1 || echo 'k230-camera: gadget cleanup failed' >&2
+    fi
+    if [ -n "$isp_invocation" ]; then
+        if ! current_invocation=$(systemctl show --property=InvocationID --value "$ISP_SERVICE" 9>&-); then
+            echo "k230-camera: could not identify the current invocation of $ISP_SERVICE" >&2
+        elif [ "$current_invocation" = "$isp_invocation" ]; then
+            systemctl --job-mode=fail stop "$ISP_SERVICE" 9>&- || echo "k230-camera: could not stop $ISP_SERVICE" >&2
+        fi
     fi
     if [ "$restore_adb" = 1 ]; then
         if timeout -k 2 15 "$ADB_SCRIPT" start 9>&- >>"$RUN_DIR/gadget.log" 2>&1; then
@@ -97,11 +166,14 @@ main() {
     mkdir -p "$RUN_DIR" || return 1
     exec 9>"$RUN_DIR/lock" || return 1
     flock -n 9 || { fail 'another instance is running'; return 1; }
-    check_usb || return 1
     trap cleanup EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
-    if [ "$restore_adb" = 1 ]; then
+    start_isp || return 1
+    [ -c "$VIDEO_UVC" ] || { fail "$VIDEO_UVC is unavailable"; return 1; }
+    check_usb || return 1
+    if [ "$adb_active" = 1 ]; then
+        restore_adb=1
         timeout -k 2 15 "$ADB_SCRIPT" stop 9>&- >>"$RUN_DIR/gadget.log" 2>&1 || { fail 'ADB/MTP stop failed'; return 1; }
         for ((i=0; i<50; i++)); do
             bound=$(cat "$GADGET_ROOT/g1/UDC" 9>&- 2>/dev/null || :)
